@@ -740,7 +740,7 @@ Bun.serve({
     if (INJECT_SECRET && auth !== INJECT_SECRET) {
       return new Response('unauthorized', { status: 401 })
     }
-    let body: { content: string; chat_id: string; user?: string; message_id?: string }
+    let body: { content: string; chat_id: string; user?: string; message_id?: string; is_thread?: boolean }
     try {
       body = await req.json()
     } catch {
@@ -761,6 +761,7 @@ Bun.serve({
           user: body.user ?? 'temporal-sweeper',
           user_id: 'synthetic',
           ts,
+          ...(body.is_thread ? { is_thread: 'true' } : {}),
         },
       },
     }).catch((err: Error) => {
@@ -855,6 +856,26 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 client.on('messageCreate', msg => {
   if (msg.author.bot) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+})
+
+// Auto-join public threads in allowlisted channels so messageCreate fires
+// for thread messages. Without this, thread messages are silently dropped.
+client.on('threadCreate', async (thread) => {
+  const parentId = thread.parentId ?? thread.id
+  const access = loadAccess()
+  if (parentId in access.groups) {
+    await thread.join().catch(() => {})
+  }
+})
+
+client.on('threadListSync', async (threads) => {
+  const access = loadAccess()
+  for (const [, thread] of threads) {
+    const parentId = thread.parentId ?? thread.id
+    if (parentId in access.groups) {
+      await thread.join().catch(() => {})
+    }
+  }
 })
 
 // Reaction notifications: when someone reacts to a message, notify Claude
