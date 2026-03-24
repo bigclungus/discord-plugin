@@ -454,7 +454,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. If the inbound message has is_thread="true", the chat_id IS the thread channel — reply to it directly and the response will land inside the thread. Do NOT switch to the main channel. Use reply_to (set to a message_id) only to create a visible quote-reference to a specific earlier message; it does NOT create a new Discord thread and is not needed for normal replies.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -521,7 +521,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.',
+        'Reply on Discord. Pass chat_id from the inbound message. If the inbound message had is_thread="true", its chat_id is already the thread channel — reply directly to it without reply_to. Use reply_to only to create a quote-reply reference to a specific earlier message (it does NOT create a new thread).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -529,7 +529,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           reply_to: {
             type: 'string',
-            description: 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
+            description: 'Optional message ID to quote-reply to. Creates a visible reference to that message, NOT a new Discord thread. Omit for normal replies.',
           },
           files: {
             type: 'array',
@@ -986,6 +986,12 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  // If the message is in a thread, expose thread metadata so the model knows
+  // to reply into the thread (chat_id is already the thread channel ID, but
+  // without this flag the model can't distinguish it from a main channel).
+  const isThread = msg.channel.isThread()
+  const parentChannelId = isThread ? (msg.channel.parentId ?? undefined) : undefined
+
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -996,6 +1002,7 @@ async function handleInbound(msg: Message): Promise<void> {
         user: msg.author.username,
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
+        ...(isThread ? { is_thread: 'true', ...(parentChannelId ? { parent_channel_id: parentChannelId } : {}) } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
