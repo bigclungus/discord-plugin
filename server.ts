@@ -84,9 +84,11 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
-  partials: [Partials.Channel],
+  // Message/Reaction partials needed for reaction events on uncached messages.
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 })
 
 type PendingEntry = {
@@ -719,6 +721,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
+// --- Inject endpoint (port 9876) ---
+// Allows Temporal workflows and scripts to send synthetic MCP notifications
+// to Claude without going through the Discord bot API (bots can't read their
+// own messages). POST /inject with x-inject-secret header and JSON body:
+// { content: string, chat_id: string, user?: string, message_id?: string }
+const INJECT_PORT = 9876
+const INJECT_SECRET = process.env.DISCORD_INJECT_SECRET ?? ''
+
+Bun.serve({
+  port: INJECT_PORT,
+  hostname: '127.0.0.1',
+  async fetch(req: Request) {
+    if (req.method !== 'POST' || new URL(req.url).pathname !== '/inject') {
+      return new Response('not found', { status: 404 })
+    }
+    const auth = req.headers.get('x-inject-secret') ?? ''
+    if (INJECT_SECRET && auth !== INJECT_SECRET) {
+      return new Response('unauthorized', { status: 401 })
+    }
+    let body: { content: string; chat_id: string; user?: string; message_id?: string }
+    try {
+      body = await req.json()
+    } catch {
+      return new Response('bad json', { status: 400 })
+    }
+    if (!body.content || !body.chat_id) {
+      return new Response('content and chat_id required', { status: 400 })
+    }
+    const ts = new Date().toISOString()
+    const msgId = body.message_id ?? `synth-${Date.now()}`
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: body.content,
+        meta: {
+          chat_id: body.chat_id,
+          message_id: msgId,
+          user: body.user ?? 'temporal-sweeper',
+          user_id: 'synthetic',
+          ts,
+        },
+      },
+    }).catch((err: Error) => {
+      process.stderr.write(`discord channel: inject delivery failed: ${err}\n`)
+    })
+    return new Response('ok', { status: 200 })
+  },
+})
+process.stderr.write(`discord channel: inject endpoint on 127.0.0.1:${INJECT_PORT}\n`)
+// --- end inject endpoint ---
+
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the gateway stays connected as a zombie holding resources.
 let shuttingDown = false
@@ -802,6 +855,74 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 client.on('messageCreate', msg => {
   if (msg.author.bot) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+})
+
+// Reaction notifications: when someone reacts to a message, notify Claude
+// with the emoji, the reactor's username, and the content of the reacted-to
+// message. Only fires for channels/DMs that are already in the access list
+// (same gate as inbound messages).
+client.on('messageReactionAdd', async (reaction, user) => {
+  try {
+    // Ignore bot reactions (including our own ack reactions)
+    if (user.bot) return
+
+    // Fetch partial objects if needed
+    if (reaction.partial) {
+      try { await reaction.fetch() } catch { return }
+    }
+    if (user.partial) {
+      try { await user.fetch() } catch { return }
+    }
+
+    const msg = reaction.message
+    // Fetch the full message if it's partial (needed for content + channelId)
+    const fullMsg = msg.partial ? await msg.fetch().catch(() => null) : msg
+    if (!fullMsg) return
+
+    // Gate: only deliver if this channel is in the access list
+    const access = loadAccess()
+    const channelId = fullMsg.channelId
+    const ch = await client.channels.fetch(channelId).catch(() => null)
+    if (!ch) return
+
+    let allowed = false
+    if (ch.type === ChannelType.DM) {
+      // For DMs, check the DM channel recipient
+      const dmCh = ch as import('discord.js').DMChannel
+      allowed = access.allowFrom.includes(dmCh.recipientId ?? '')
+    } else {
+      const key = ch.isThread?.() ? (ch as import('discord.js').ThreadChannel).parentId ?? channelId : channelId
+      allowed = key in access.groups
+    }
+    if (!allowed) return
+
+    const emoji = reaction.emoji.toString()
+    const reactorName = user.username
+    const msgContent = fullMsg.content || '(no text content)'
+    const msgAuthor = fullMsg.author?.username ?? 'unknown'
+    const truncated = msgContent.length > 200 ? msgContent.slice(0, 200) + '…' : msgContent
+
+    const content =
+      `[reaction] ${reactorName} reacted ${emoji} to a message by ${msgAuthor}: "${truncated}"`
+
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id: channelId,
+          message_id: `reaction-${fullMsg.id}-${Date.now()}`,
+          user: reactorName,
+          user_id: user.id,
+          ts: new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: failed to deliver reaction to Claude: ${err}\n`)
+    })
+  } catch (err) {
+    process.stderr.write(`discord channel: messageReactionAdd error: ${err}\n`)
+  }
 })
 
 async function handleInbound(msg: Message): Promise<void> {
