@@ -224,6 +224,12 @@ type GateResult =
 const recentSentIds = new Set<string>()
 const RECENT_SENT_CAP = 200
 
+// Track thread IDs we've seen recently for cold-thread detection.
+// A thread is "cold" (needs context injection) if we haven't seen it
+// in the last 5 minutes. Maps thread_id -> last_seen_ts (ms).
+const seenThreads = new Map<string, number>()
+const THREAD_COLD_MS = 5 * 60 * 1000
+
 function noteSent(id: string): void {
   recentSentIds.add(id)
   if (recentSentIds.size > RECENT_SENT_CAP) {
@@ -454,7 +460,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. If the inbound message has is_thread="true", the chat_id IS the thread channel — reply to it directly and the response will land inside the thread. Do NOT switch to the main channel. Use reply_to (set to a message_id) only to create a visible quote-reference to a specific earlier message; it does NOT create a new Discord thread and is not needed for normal replies.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -521,7 +527,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Discord. Pass chat_id from the inbound message. If the inbound message had is_thread="true", its chat_id is already the thread channel — reply directly to it without reply_to. Use reply_to only to create a quote-reply reference to a specific earlier message (it does NOT create a new thread).',
+        'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -529,7 +535,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           reply_to: {
             type: 'string',
-            description: 'Optional message ID to quote-reply to. Creates a visible reference to that message, NOT a new Discord thread. Omit for normal replies.',
+            description: 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
           },
           files: {
             type: 'array',
@@ -740,7 +746,7 @@ Bun.serve({
     if (INJECT_SECRET && auth !== INJECT_SECRET) {
       return new Response('unauthorized', { status: 401 })
     }
-    let body: { content: string; chat_id: string; user?: string; message_id?: string; is_thread?: boolean }
+    let body: { content: string; chat_id: string; user?: string; message_id?: string }
     try {
       body = await req.json()
     } catch {
@@ -761,7 +767,6 @@ Bun.serve({
           user: body.user ?? 'temporal-sweeper',
           user_id: 'synthetic',
           ts,
-          ...(body.is_thread ? { is_thread: 'true' } : {}),
         },
       },
     }).catch((err: Error) => {
@@ -858,26 +863,6 @@ client.on('messageCreate', msg => {
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
-// Auto-join public threads in allowlisted channels so messageCreate fires
-// for thread messages. Without this, thread messages are silently dropped.
-client.on('threadCreate', async (thread) => {
-  const parentId = thread.parentId ?? thread.id
-  const access = loadAccess()
-  if (parentId in access.groups) {
-    await thread.join().catch(() => {})
-  }
-})
-
-client.on('threadListSync', async (threads) => {
-  const access = loadAccess()
-  for (const [, thread] of threads) {
-    const parentId = thread.parentId ?? thread.id
-    if (parentId in access.groups) {
-      await thread.join().catch(() => {})
-    }
-  }
-})
-
 // Reaction notifications: when someone reacts to a message, notify Claude
 // with the emoji, the reactor's username, and the content of the reacted-to
 // message. Only fires for channels/DMs that are already in the access list
@@ -921,7 +906,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     const reactorName = user.username
     const msgContent = fullMsg.content || '(no text content)'
     const msgAuthor = fullMsg.author?.username ?? 'unknown'
-    const truncated = msgContent.length > 200 ? msgContent.slice(0, 200) + '…' : msgContent
+    const truncated = msgContent.length > 500 ? msgContent.slice(0, 500) + '…' : msgContent
 
     const content =
       `[reaction] ${reactorName} reacted ${emoji} to a message by ${msgAuthor}: "${truncated}"`
@@ -932,10 +917,11 @@ client.on('messageReactionAdd', async (reaction, user) => {
         content,
         meta: {
           chat_id: channelId,
-          message_id: `reaction-${fullMsg.id}-${Date.now()}`,
+          message_id: fullMsg.id,
           user: reactorName,
           user_id: user.id,
           ts: new Date().toISOString(),
+          reacted_message_id: fullMsg.id,
         },
       },
     }).catch(err => {
@@ -945,19 +931,6 @@ client.on('messageReactionAdd', async (reaction, user) => {
     process.stderr.write(`discord channel: messageReactionAdd error: ${err}\n`)
   }
 })
-
-// Truncate a string to maxLen chars, appending ellipsis if cut.
-function truncate(s: string, maxLen: number): string {
-  if (s.length <= maxLen) return s
-  return s.slice(0, maxLen) + '…'
-}
-
-// Format a Discord message (from history/reference) into a compact one-liner.
-function formatHistoryMsg(m: Message, meId: string | undefined): string {
-  const who = m.author.id === meId ? 'me' : m.author.username
-  const text = truncate(m.content.replace(/[\r\n]+/g, ' ⏎ ') || '(no text)', 300)
-  return `[${m.createdAt.toISOString()}] ${who}: ${text}`
-}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
@@ -1018,64 +991,64 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const rawContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
-
-  // If the message is in a thread, expose thread metadata so the model knows
-  // to reply into the thread (chat_id is already the thread channel ID, but
-  // without this flag the model can't distinguish it from a main channel).
-  const isThread = msg.channel.isThread()
-  const parentChannelId = isThread ? (msg.channel.parentId ?? undefined) : undefined
+  const baseContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
   // --- Context enrichment ---
-  // Build prefix blocks that give Claude full context without requiring
-  // manual fetch_messages calls. Both blocks are prepended to content.
-  const me = client.user?.id
   const contextParts: string[] = []
 
-  // 1. Quote-reply context: when this message is a reply to another message,
-  //    fetch the referenced message and include it so Claude knows what's
-  //    being responded to.
+  // 1. Reply context: if this message is a reply, fetch the referenced message.
+  //    Skip if the referenced message is from our own bot (we already know what we said).
   const refId = msg.reference?.messageId
   if (refId) {
     try {
       const refMsg = await msg.channel.messages.fetch(refId)
-      const refWho = refMsg.author.id === me ? 'me' : refMsg.author.username
-      const refText = truncate(refMsg.content.replace(/[\r\n]+/g, ' ⏎ ') || '(no text)', 300)
-      const refTs = refMsg.createdAt.toISOString()
-      contextParts.push(
-        `<referenced_message author="${refWho}" ts="${refTs}">${refText}</referenced_message>`
-      )
-    } catch {
-      // Fetch failed (deleted message, missing perms) — continue without it.
-    }
-  }
-
-  // 2. Thread context: when the message arrives from inside a thread, fetch
-  //    the last 8 messages (excluding the current one) so Claude has the
-  //    conversation history inline.
-  if (isThread) {
-    try {
-      const history = await msg.channel.messages.fetch({ limit: 9 })
-      // history is a Collection ordered newest-first; skip the current msg.
-      const prior = [...history.values()]
-        .filter(m => m.id !== msg.id)
-        .slice(0, 8)
-        .reverse() // oldest-first for readability
-      if (prior.length > 0) {
-        const lines = prior.map(m => formatHistoryMsg(m as Message, me))
-        contextParts.push(
-          `<thread_context>\n${lines.join('\n')}\n</thread_context>`
-        )
+      if (refMsg.author.id !== client.user?.id) {
+        const refText = refMsg.content.slice(0, 300) + (refMsg.content.length > 300 ? '…' : '')
+        const refAuthor = refMsg.author.username
+        const refTs = refMsg.createdAt.toISOString()
+        contextParts.push(`<referenced_message author="${refAuthor}" ts="${refTs}">${refText}</referenced_message>`)
       }
     } catch {
-      // Fetch failed — continue without thread context.
+      // Deleted message or missing perms — skip silently.
     }
   }
 
-  // Prepend context blocks (if any) before the actual message content.
+  // 2. Thread context: for thread channels (type 11 = PublicThread, 12 = PrivateThread),
+  //    inject the last 3 messages if this is the first message we've seen from this thread
+  //    in the last 5 minutes (cold thread).
+  const chType = msg.channel.type
+  if (chType === ChannelType.PublicThread || chType === ChannelType.PrivateThread) {
+    const now = Date.now()
+    const lastSeen = seenThreads.get(chat_id)
+    const isCold = lastSeen === undefined || (now - lastSeen) > THREAD_COLD_MS
+    seenThreads.set(chat_id, now)
+
+    if (isCold) {
+      try {
+        const history = await msg.channel.messages.fetch({ limit: 10 })
+        const botId = client.user?.id
+        const sorted = [...history.values()]
+          .filter(m => m.id !== msg.id && m.author.id !== botId)
+          .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+          .slice(-3)
+
+        if (sorted.length > 0) {
+          const lines = sorted.map(m => {
+            const text = m.content.slice(0, 200) + (m.content.length > 200 ? '…' : '')
+            return `  <msg author="${m.author.username}" ts="${m.createdAt.toISOString()}">${text}</msg>`
+          })
+          contextParts.push(`<thread_context>\n${lines.join('\n')}\n</thread_context>`)
+        }
+      } catch {
+        // Missing perms or fetch error — skip silently.
+      }
+    }
+  }
+
   const content = contextParts.length > 0
-    ? contextParts.join('\n') + '\n' + rawContent
-    : rawContent
+    ? `${baseContent}\n${contextParts.join('\n')}`
+    : baseContent
+  // --- end context enrichment ---
 
   mcp.notification({
     method: 'notifications/claude/channel',
@@ -1087,7 +1060,6 @@ async function handleInbound(msg: Message): Promise<void> {
         user: msg.author.username,
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
-        ...(isThread ? { is_thread: 'true', ...(parentChannelId ? { parent_channel_id: parentChannelId } : {}) } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
