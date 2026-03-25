@@ -946,6 +946,19 @@ client.on('messageReactionAdd', async (reaction, user) => {
   }
 })
 
+// Truncate a string to maxLen chars, appending ellipsis if cut.
+function truncate(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s
+  return s.slice(0, maxLen) + '…'
+}
+
+// Format a Discord message (from history/reference) into a compact one-liner.
+function formatHistoryMsg(m: Message, meId: string | undefined): string {
+  const who = m.author.id === meId ? 'me' : m.author.username
+  const text = truncate(m.content.replace(/[\r\n]+/g, ' ⏎ ') || '(no text)', 300)
+  return `[${m.createdAt.toISOString()}] ${who}: ${text}`
+}
+
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
 
@@ -1005,13 +1018,64 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const rawContent = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
   // If the message is in a thread, expose thread metadata so the model knows
   // to reply into the thread (chat_id is already the thread channel ID, but
   // without this flag the model can't distinguish it from a main channel).
   const isThread = msg.channel.isThread()
   const parentChannelId = isThread ? (msg.channel.parentId ?? undefined) : undefined
+
+  // --- Context enrichment ---
+  // Build prefix blocks that give Claude full context without requiring
+  // manual fetch_messages calls. Both blocks are prepended to content.
+  const me = client.user?.id
+  const contextParts: string[] = []
+
+  // 1. Quote-reply context: when this message is a reply to another message,
+  //    fetch the referenced message and include it so Claude knows what's
+  //    being responded to.
+  const refId = msg.reference?.messageId
+  if (refId) {
+    try {
+      const refMsg = await msg.channel.messages.fetch(refId)
+      const refWho = refMsg.author.id === me ? 'me' : refMsg.author.username
+      const refText = truncate(refMsg.content.replace(/[\r\n]+/g, ' ⏎ ') || '(no text)', 300)
+      const refTs = refMsg.createdAt.toISOString()
+      contextParts.push(
+        `<referenced_message author="${refWho}" ts="${refTs}">${refText}</referenced_message>`
+      )
+    } catch {
+      // Fetch failed (deleted message, missing perms) — continue without it.
+    }
+  }
+
+  // 2. Thread context: when the message arrives from inside a thread, fetch
+  //    the last 8 messages (excluding the current one) so Claude has the
+  //    conversation history inline.
+  if (isThread) {
+    try {
+      const history = await msg.channel.messages.fetch({ limit: 9 })
+      // history is a Collection ordered newest-first; skip the current msg.
+      const prior = [...history.values()]
+        .filter(m => m.id !== msg.id)
+        .slice(0, 8)
+        .reverse() // oldest-first for readability
+      if (prior.length > 0) {
+        const lines = prior.map(m => formatHistoryMsg(m as Message, me))
+        contextParts.push(
+          `<thread_context>\n${lines.join('\n')}\n</thread_context>`
+        )
+      }
+    } catch {
+      // Fetch failed — continue without thread context.
+    }
+  }
+
+  // Prepend context blocks (if any) before the actual message content.
+  const content = contextParts.length > 0
+    ? contextParts.join('\n') + '\n' + rawContent
+    : rawContent
 
   mcp.notification({
     method: 'notifications/claude/channel',
