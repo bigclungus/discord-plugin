@@ -904,13 +904,29 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
     const emoji = reaction.emoji.toString()
     const reactorName = user.username
-    const msgContent = fullMsg.content || '(no text content)'
+    const msgContent = fullMsg.content || ''
     const msgAuthor = fullMsg.author?.username ?? 'unknown'
-    const truncated = msgContent.length > 500 ? msgContent.slice(0, 500) + '…' : msgContent
+    const msgTs = fullMsg.createdAt.toISOString()
     const isThread = ch.isThread?.() ?? false
 
+    // Build a rich context block for the reacted-to message.
+    // Include the full text (no truncation) and any attachments.
+    const msgAtts = [...fullMsg.attachments.values()]
+    const attParts = msgAtts.map(a => `<attachment name="${a.name}" type="${a.contentType ?? 'unknown'}" url="${a.url}" />`)
+
+    let msgBlock: string
+    if (msgContent && attParts.length > 0) {
+      msgBlock = `${msgContent}\n${attParts.join('\n')}`
+    } else if (msgContent) {
+      msgBlock = msgContent
+    } else if (attParts.length > 0) {
+      msgBlock = attParts.join('\n')
+    } else {
+      msgBlock = '(no text content)'
+    }
+
     const content =
-      `[reaction] ${reactorName} reacted ${emoji} to a message by ${msgAuthor}: "${truncated}"`
+      `[reaction] ${reactorName} reacted ${emoji} to a message by ${msgAuthor} (id:${fullMsg.id}, ts:${msgTs}):\n${msgBlock}`
 
     mcp.notification({
       method: 'notifications/claude/channel',
