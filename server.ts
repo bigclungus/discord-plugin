@@ -907,6 +907,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     const msgContent = fullMsg.content || '(no text content)'
     const msgAuthor = fullMsg.author?.username ?? 'unknown'
     const truncated = msgContent.length > 500 ? msgContent.slice(0, 500) + '…' : msgContent
+    const isThread = ch.isThread?.() ?? false
 
     const content =
       `[reaction] ${reactorName} reacted ${emoji} to a message by ${msgAuthor}: "${truncated}"`
@@ -918,10 +919,11 @@ client.on('messageReactionAdd', async (reaction, user) => {
         meta: {
           chat_id: channelId,
           message_id: fullMsg.id,
+          reacted_message_id: fullMsg.id,
           user: reactorName,
           user_id: user.id,
+          is_thread: isThread,
           ts: new Date().toISOString(),
-          reacted_message_id: fullMsg.id,
         },
       },
     }).catch(err => {
