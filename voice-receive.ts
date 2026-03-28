@@ -6,9 +6,13 @@
  * for transcription, and injects the result as a "[vc]" message via the
  * local inject endpoint.
  *
+ * On teardown (last person leaves), compiles all transcriptions from the
+ * session and uploads them as a .txt file to #voice-transcripts.
+ *
  * Usage (from server.ts after consolidation):
  *   import { setupVoiceReceive } from './voice-receive'
- *   setupVoiceReceive(connection, client, injectSecret, injectChatId)
+ *   const teardown = setupVoiceReceive(connection, client, injectSecret, injectChatId)
+ *   await teardown()  // returns a Promise now
  */
 
 import { type VoiceConnection, EndBehaviorType } from '@discordjs/voice'
@@ -61,6 +65,12 @@ const INJECT_URL = 'http://127.0.0.1:9876/inject'
 /** Default chat ID (main channel). Caller can override. */
 const DEFAULT_CHAT_ID = '1485343472952148008'
 
+/** Channel ID for posting session transcripts. */
+const TRANSCRIPT_CHANNEL_ID = '1487240658568744980'
+
+/** Discord API base URL. */
+const DISCORD_API = 'https://discord.com/api/v10'
+
 /** Temp directory for WAV files. */
 const TMP_DIR = join(tmpdir(), 'bc-voice-stt')
 
@@ -79,6 +89,26 @@ interface UserAudioBuffer {
   startTime: number
   /** Resolved Discord username. */
   username: string
+}
+
+// ---------------------------------------------------------------------------
+// Session transcript
+// ---------------------------------------------------------------------------
+
+interface TranscriptEntry {
+  username: string
+  text: string
+  timestamp: Date
+  isBot: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Exported teardown type (teardown function with logBotSpeech attached)
+// ---------------------------------------------------------------------------
+
+export interface VoiceTeardown {
+  (): Promise<void>
+  logBotSpeech: (text: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -219,10 +249,118 @@ async function injectTranscription(
 }
 
 // ---------------------------------------------------------------------------
+// Discord API helper — post message to a channel
+// ---------------------------------------------------------------------------
+
+async function postToChannel(
+  channelId: string,
+  content: string,
+  botToken: string,
+): Promise<void> {
+  const resp = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'BigClungus/1.0',
+    },
+    body: JSON.stringify({ content }),
+  })
+
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '(no body)')
+    throw new Error(`Discord POST to channel ${channelId} failed ${resp.status}: ${detail}`)
+  }
+}
+
+/**
+ * Upload a .txt file to a Discord channel.
+ */
+async function postFileToChannel(
+  channelId: string,
+  filename: string,
+  fileContent: string,
+  messageText: string,
+  botToken: string,
+): Promise<void> {
+  const boundary = `----BigClungus${randomBytes(8).toString('hex')}`
+  const fileBuf = Buffer.from(fileContent, 'utf-8')
+
+  const parts: Buffer[] = []
+
+  // JSON payload part
+  const payloadJson = JSON.stringify({
+    content: messageText,
+    attachments: [{ id: 0, filename }],
+  })
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n${payloadJson}\r\n`
+  ))
+
+  // File part
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="${filename}"\r\nContent-Type: text/plain\r\n\r\n`
+  ))
+  parts.push(fileBuf)
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`))
+
+  const body = Buffer.concat(parts)
+
+  const resp = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bot ${botToken}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'User-Agent': 'BigClungus/1.0',
+    },
+    body,
+  })
+
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '(no body)')
+    throw new Error(`Discord file upload to ${channelId} failed ${resp.status}: ${detail}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript formatting
+// ---------------------------------------------------------------------------
+
+function formatTimestamp(date: Date): string {
+  const h = date.getHours().toString().padStart(2, '0')
+  const m = date.getMinutes().toString().padStart(2, '0')
+  const s = date.getSeconds().toString().padStart(2, '0')
+  return `${h}:${m}:${s}`
+}
+
+function formatTranscript(entries: TranscriptEntry[], sessionStart: Date): string {
+  const now = new Date()
+  const durationMs = now.getTime() - sessionStart.getTime()
+  const durationMin = Math.round(durationMs / 60_000)
+
+  const dateStr = sessionStart.toLocaleDateString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  })
+
+  const header = `**VC Session Transcript** \u2014 ${dateStr}\nDuration: ${durationMin} minute${durationMin !== 1 ? 's' : ''}\n\n`
+
+  const lines = entries.map((e) => {
+    const ts = formatTimestamp(e.timestamp)
+    const botMarker = e.isBot ? ' \uD83D\uDD0A' : ''
+    return `[${ts}] **${e.username}**${botMarker}: ${e.text}`
+  })
+
+  return header + lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // Username resolution
 // ---------------------------------------------------------------------------
 
-/** Cache user ID → username to avoid repeated API calls. */
+/** Cache user ID -> username to avoid repeated API calls. */
 const usernameCache = new Map<string, string>()
 
 async function resolveUsername(client: Client, userId: string): Promise<string> {
@@ -253,20 +391,26 @@ async function resolveUsername(client: Client, userId: string): Promise<string> 
  * @param client       - The Discord.js Client (for resolving usernames)
  * @param injectSecret - The DISCORD_INJECT_SECRET value
  * @param injectChatId - Chat ID to inject transcriptions into (defaults to main channel)
- * @returns A teardown function that stops all listening and cleans up.
+ * @returns A teardown function (async) that stops all listening, flushes pending
+ *          transcriptions, and posts the session transcript. Has a .logBotSpeech()
+ *          method for recording bot speech events.
  */
 export function setupVoiceReceive(
   connection: VoiceConnection,
   client: Client,
   injectSecret: string,
   injectChatId: string = DEFAULT_CHAT_ID,
-): () => void {
+): VoiceTeardown {
   // Ensure temp dir exists
   mkdirSync(TMP_DIR, { recursive: true })
 
   const buffers = new Map<string, UserAudioBuffer>()
   const decoder = new OpusEncoder(48000, 2)  // Discord sends 48 kHz stereo Opus
   let destroyed = false
+
+  // Session transcript accumulator
+  const transcript: TranscriptEntry[] = []
+  const sessionStart = new Date()
 
   // -----------------------------------------------------------------------
   // Flush a single user's buffer: downsample, write WAV, transcribe, inject.
@@ -292,6 +436,14 @@ export function setupVoiceReceive(
 
       if (isValidTranscription(text)) {
         await injectTranscription(buf.username, text, injectSecret, injectChatId)
+
+        // Add to session transcript
+        transcript.push({
+          username: buf.username,
+          text,
+          timestamp: new Date(),
+          isBot: false,
+        })
       }
     } catch (err) {
       process.stderr.write(
@@ -349,14 +501,14 @@ export function setupVoiceReceive(
 
       userBuf.lastPacketTime = now
 
-      // Decode Opus → 48 kHz stereo PCM, then downsample to 16 kHz mono
+      // Decode Opus -> 48 kHz stereo PCM, then downsample to 16 kHz mono
       try {
         const pcm48kStereo = decoder.decode(opusPacket)
         const pcm16kMono = downsample48kStereoTo16kMono(pcm48kStereo)
         userBuf.chunks.push(pcm16kMono)
         userBuf.byteLength += pcm16kMono.length
       } catch (err) {
-        // Malformed Opus packet — skip
+        // Malformed Opus packet -- skip
         process.stderr.write(
           `voice-receive: opus decode error: ${err instanceof Error ? err.message : String(err)}\n`,
         )
@@ -406,9 +558,9 @@ export function setupVoiceReceive(
   }, FLUSH_INTERVAL_MS)
 
   // -----------------------------------------------------------------------
-  // Teardown function
+  // Teardown function (async — awaits pending flushes + posts transcript)
   // -----------------------------------------------------------------------
-  return function teardown(): void {
+  async function teardown(): Promise<void> {
     destroyed = true
     clearInterval(flushInterval)
     connection.receiver.speaking.removeListener('start', onSpeakingStart)
@@ -419,9 +571,65 @@ export function setupVoiceReceive(
       connection.receiver.subscriptions.delete(userId)
     }
 
-    // Flush any remaining buffers synchronously-ish (fire and forget)
+    // Flush any remaining buffers and await them all
+    const flushPromises: Promise<void>[] = []
     for (const [userId] of buffers) {
-      flushBuffer(userId).catch(() => {})
+      flushPromises.push(flushBuffer(userId))
     }
+    await Promise.allSettled(flushPromises)
+
+    // Post session transcript if we have entries — always as a .txt file upload
+    if (transcript.length > 0) {
+      const botToken = process.env.DISCORD_BOT_TOKEN
+      if (!botToken) {
+        process.stderr.write('voice-receive: cannot post transcript — no DISCORD_BOT_TOKEN\n')
+        return
+      }
+
+      try {
+        const fullText = formatTranscript(transcript, sessionStart)
+
+        const dateSlug = sessionStart.toISOString().replace(/[:.]/g, '-').slice(0, 19)
+        const filename = `vc-transcript-${dateSlug}.txt`
+
+        // Plain text version for the file (strip markdown bold)
+        const plainText = fullText.replace(/\*\*/g, '')
+
+        const durationMs = Date.now() - sessionStart.getTime()
+        const durationMin = Math.round(durationMs / 60_000)
+        const dateStr = sessionStart.toLocaleDateString('en-US', {
+          month: 'long',
+          day: 'numeric',
+          year: 'numeric',
+        })
+        const summary = `VC Session \u2014 ${dateStr} \u2014 ${durationMin} min, ${transcript.length} messages`
+
+        await postFileToChannel(TRANSCRIPT_CHANNEL_ID, filename, plainText, summary, botToken)
+
+        process.stderr.write(
+          `voice-receive: posted session transcript (${transcript.length} entries) to #voice-transcripts\n`,
+        )
+      } catch (err) {
+        process.stderr.write(
+          `voice-receive: failed to post transcript: ${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
+    }
+
+    // Clear transcript
+    transcript.length = 0
   }
+
+  // Build the VoiceTeardown: teardown function with logBotSpeech attached
+  const result = teardown as VoiceTeardown
+  result.logBotSpeech = (text: string) => {
+    transcript.push({
+      username: 'BigClungus',
+      text,
+      timestamp: new Date(),
+      isBot: true,
+    })
+  }
+
+  return result
 }
