@@ -104,11 +104,11 @@ async function connectToVoice(
   }
 }
 
-function disconnectFromVoice(guildId: string): boolean {
+async function disconnectFromVoice(guildId: string): Promise<boolean> {
   const connection = getVoiceConnection(guildId)
   if (!connection) return false
   const teardown = (connection as any)._voiceReceiveTeardown
-  if (teardown) teardown()
+  if (teardown) await teardown()
   connection.destroy()
   return true
 }
@@ -687,6 +687,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           file: { type: 'string', description: 'Absolute path to the audio file to play (WAV, OGG, or MP3).' },
           guild_id: { type: 'string', description: 'The guild ID where the bot is in a voice channel. Defaults to the first available voice connection if omitted.' },
+          text: { type: 'string', description: 'The text that was spoken (for transcript logging). If provided, the bot\'s speech will appear in the VC session transcript.' },
         },
         required: ['file'],
       },
@@ -808,6 +809,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!ch.isVoiceBased()) throw new Error(`channel ${channel_id} is not a voice channel`)
         if (!('guild' in ch) || !ch.guild) throw new Error(`channel ${channel_id} has no guild context`)
 
+        // Guardrail: don't join an empty voice channel (no non-bot members)
+        if ('members' in ch && ch.members) {
+          const humans = (ch.members as Map<string, any>).size > 0
+            ? [...(ch.members as Map<string, any>).values()].filter((m: any) => !m.user?.bot)
+            : []
+          if (humans.length === 0) {
+            return {
+              content: [{ type: 'text', text: `won't join an empty voice channel — no humans present` }],
+            }
+          }
+        }
+
         await connectToVoice(ch.id, ch.guild.id, ch.guild.voiceAdapterCreator, client, process.env.DISCORD_INJECT_SECRET)
 
         return {
@@ -816,7 +829,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'leave_voice': {
         const guild_id = args.guild_id as string
-        if (!disconnectFromVoice(guild_id)) {
+        if (!(await disconnectFromVoice(guild_id))) {
           return {
             content: [{ type: 'text', text: `not in a voice channel in guild ${guild_id}` }],
           }
@@ -828,6 +841,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'speak': {
         const filePath = args.file as string
         const guild_id = args.guild_id as string | undefined
+        const spokenText = args.text as string | undefined
 
         // Validate the audio file exists
         if (!existsSync(filePath)) {
@@ -858,6 +872,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           )
         }
 
+        // Guardrail: skip playback if no humans remain in the voice channel
+        {
+          const vcChannelId = (connection as any).joinConfig?.channelId
+          const vcGuildId = resolvedGuildId ?? (connection as any).joinConfig?.guildId
+          if (vcChannelId && vcGuildId) {
+            const guild = await client.guilds.fetch(vcGuildId)
+            const vcChannel = await guild.channels.fetch(vcChannelId)
+            if (vcChannel && 'members' in vcChannel && vcChannel.members) {
+              const humans = [...(vcChannel.members as Map<string, any>).values()].filter((m: any) => !m.user?.bot)
+              if (humans.length === 0) {
+                return {
+                  content: [{ type: 'text', text: `skipping playback — no humans in the voice channel` }],
+                }
+              }
+            }
+          }
+        }
+
         try {
           // Create audio player and resource
           const player = createAudioPlayer({
@@ -885,6 +917,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             player.on(AudioPlayerStatus.Idle, onIdle)
             player.on('error', onError)
           })
+
+          // Log bot speech to session transcript if text was provided
+          if (spokenText && connection) {
+            const teardown = (connection as any)._voiceReceiveTeardown
+            if (teardown?.logBotSpeech) {
+              teardown.logBotSpeech(spokenText)
+            }
+          }
 
           const fileSize = statSync(filePath).size
           return {
@@ -1108,7 +1148,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
       const humanMembers = ch.members.filter(m => !m.user.bot)
       if (humanMembers.size === 0) {
-        if (disconnectFromVoice(guild.id)) {
+        if (await disconnectFromVoice(guild.id)) {
           process.stderr.write(`discord: auto-left voice channel ${AUTO_VOICE_CHANNEL} (no humans remaining)\n`)
         }
       }
