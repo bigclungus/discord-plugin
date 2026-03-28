@@ -29,8 +29,19 @@ import {
   type Attachment,
   type Interaction,
 } from 'discord.js'
+import {
+  joinVoiceChannel,
+  VoiceConnectionStatus,
+  entersState,
+  getVoiceConnection,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+} from '@discordjs/voice'
+import { setupVoiceReceive } from './voice-receive.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
@@ -85,10 +96,14 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
   // Message/Reaction partials needed for reaction events on uncached messages.
   partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+  // Close stalled WebSocket connections after 15 s so the shard manager can
+  // attempt a fresh reconnect rather than hanging indefinitely on a dead socket.
+  closeTimeout: 15_000,
 })
 
 type PendingEntry = {
@@ -600,6 +615,43 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['channel'],
       },
     },
+    {
+      name: 'join_voice',
+      description:
+        'Join a Discord voice channel. The bot will connect and stay in the channel until leave_voice is called. Requires the channel ID of a voice channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channel_id: { type: 'string', description: 'The voice channel ID to join.' },
+        },
+        required: ['channel_id'],
+      },
+    },
+    {
+      name: 'leave_voice',
+      description:
+        'Leave the current voice channel in a guild. Pass the guild_id to identify which voice connection to disconnect.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          guild_id: { type: 'string', description: 'The guild ID to leave the voice channel in.' },
+        },
+        required: ['guild_id'],
+      },
+    },
+    {
+      name: 'speak',
+      description:
+        'Play an audio file (WAV/OGG/MP3) in the currently connected voice channel. The bot must already be in a voice channel via join_voice. Generate audio externally (e.g. kokoro-speak.py) then pass the file path here. The file is deleted after playback.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          file: { type: 'string', description: 'Absolute path to the audio file to play (WAV, OGG, or MP3).' },
+          guild_id: { type: 'string', description: 'The guild ID where the bot is in a voice channel. Defaults to the first available voice connection if omitted.' },
+        },
+        required: ['file'],
+      },
+    },
   ],
 }))
 
@@ -710,6 +762,128 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           content: [{ type: 'text', text: `downloaded ${lines.length} attachment(s):\n${lines.join('\n')}` }],
         }
       }
+      case 'join_voice': {
+        const channel_id = args.channel_id as string
+        const ch = await client.channels.fetch(channel_id)
+        if (!ch) throw new Error(`channel ${channel_id} not found`)
+        if (!ch.isVoiceBased()) throw new Error(`channel ${channel_id} is not a voice channel`)
+        if (!('guild' in ch) || !ch.guild) throw new Error(`channel ${channel_id} has no guild context`)
+
+        const connection = joinVoiceChannel({
+          channelId: ch.id,
+          guildId: ch.guild.id,
+          adapterCreator: ch.guild.voiceAdapterCreator,
+          selfDeaf: false,
+          selfMute: true,
+        })
+
+        try {
+          await entersState(connection, VoiceConnectionStatus.Ready, 15_000)
+        } catch (err) {
+          connection.destroy()
+          throw new Error(`failed to join voice channel: ${err instanceof Error ? err.message : String(err)}`)
+        }
+
+        // Start voice receive / STT
+        const injectSecret = process.env.DISCORD_INJECT_SECRET
+        if (injectSecret) {
+          const teardown = setupVoiceReceive(connection, client, injectSecret)
+          ;(connection as any)._voiceReceiveTeardown = teardown
+        }
+
+        return {
+          content: [{ type: 'text', text: `joined voice channel ${channel_id} in guild ${ch.guild.id}` }],
+        }
+      }
+      case 'leave_voice': {
+        const guild_id = args.guild_id as string
+        const connection = getVoiceConnection(guild_id)
+        if (!connection) {
+          return {
+            content: [{ type: 'text', text: `not in a voice channel in guild ${guild_id}` }],
+          }
+        }
+        // Clean up voice receive
+        const teardown = (connection as any)._voiceReceiveTeardown
+        if (teardown) teardown()
+        connection.destroy()
+        return {
+          content: [{ type: 'text', text: `left voice channel in guild ${guild_id}` }],
+        }
+      }
+      case 'speak': {
+        const filePath = args.file as string
+        const guild_id = args.guild_id as string | undefined
+
+        // Validate the audio file exists
+        if (!existsSync(filePath)) {
+          throw new Error(`audio file not found: ${filePath}`)
+        }
+
+        // Find the voice connection — use guild_id if provided, otherwise first available
+        let connection = guild_id ? getVoiceConnection(guild_id) : undefined
+        let resolvedGuildId = guild_id
+
+        if (!connection) {
+          // Try to find any active voice connection across guilds
+          for (const [, guild] of client.guilds.cache) {
+            const conn = getVoiceConnection(guild.id)
+            if (conn) {
+              connection = conn
+              resolvedGuildId = guild.id
+              break
+            }
+          }
+        }
+
+        if (!connection) {
+          throw new Error(
+            guild_id
+              ? `not in a voice channel in guild ${guild_id} — call join_voice first`
+              : 'not in any voice channel — call join_voice first'
+          )
+        }
+
+        try {
+          // Unmute the bot so audio can be heard
+          connection.rejoin({
+            ...connection.joinConfig,
+            selfMute: false,
+          })
+
+          // Create audio player and resource
+          const player = createAudioPlayer({
+            behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+          })
+          const resource = createAudioResource(filePath)
+
+          // Subscribe the connection to the player and play
+          connection.subscribe(player)
+          player.play(resource)
+
+          // Wait for playback to finish
+          await new Promise<void>((resolve, reject) => {
+            player.on(AudioPlayerStatus.Idle, () => resolve())
+            player.on('error', (err: Error) => reject(new Error(`audio playback error: ${err.message}`)))
+            // Timeout after 2 minutes
+            setTimeout(() => reject(new Error('speak timed out after 120s')), 120_000)
+          })
+
+          // Re-mute after speaking
+          connection.rejoin({
+            ...connection.joinConfig,
+            selfMute: true,
+          })
+
+          const fileSize = statSync(filePath).size
+          return {
+            content: [{ type: 'text', text: `played ${(fileSize / 1024).toFixed(0)}KB audio file in guild ${resolvedGuildId}` }],
+          }
+        } finally {
+          // Clean up the audio file after playback
+          try { unlinkSync(filePath) } catch {}
+        }
+      }
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -734,6 +908,10 @@ await mcp.connect(new StdioServerTransport())
 // { content: string, chat_id: string, user?: string, message_id?: string }
 const INJECT_PORT = 9876
 const INJECT_SECRET = process.env.DISCORD_INJECT_SECRET ?? ''
+
+if (!INJECT_SECRET) {
+  console.warn('[warn] DISCORD_INJECT_SECRET is not set — inject endpoint is unauthenticated')
+}
 
 Bun.serve({
   port: INJECT_PORT,
@@ -795,6 +973,28 @@ process.on('SIGINT', shutdown)
 
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
+})
+
+// Reconnect telemetry — these events fire on the WS manager, not the client,
+// but Discord.js v14 proxies them through the client when a shard is involved.
+client.on('shardDisconnect', (event, shardId) => {
+  process.stderr.write(`discord channel: shard ${shardId} disconnected (code=${event.code})\n`)
+})
+client.on('shardReconnecting', shardId => {
+  process.stderr.write(`discord channel: shard ${shardId} reconnecting\n`)
+})
+client.on('shardResume', (shardId, replayedEvents) => {
+  process.stderr.write(`discord channel: shard ${shardId} resumed (replayed=${replayedEvents})\n`)
+})
+client.on('shardError', (err, shardId) => {
+  process.stderr.write(`discord channel: shard ${shardId} error: ${err}\n`)
+})
+// invalidated fires when Discord invalidates the session and the shard manager
+// gives up — the process cannot recover from this state, so exit cleanly and
+// let systemd (Restart=on-failure) bring it back up.
+client.on('invalidated', () => {
+  process.stderr.write('discord channel: session invalidated — exiting for systemd restart\n')
+  process.exit(1)
 })
 
 // Button-click handler for permission requests. customId is
@@ -861,6 +1061,71 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 client.on('messageCreate', msg => {
   if (msg.author.bot) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+})
+
+// Auto-join/leave voice channel 1325567700029931560 when humans join/leave.
+const AUTO_VOICE_CHANNEL = '1325567700029931560'
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  try {
+    const joinedTarget = newState.channelId === AUTO_VOICE_CHANNEL && oldState.channelId !== AUTO_VOICE_CHANNEL
+    const leftTarget = oldState.channelId === AUTO_VOICE_CHANNEL && newState.channelId !== AUTO_VOICE_CHANNEL
+
+    // Human joined the target channel — auto-join if not already connected
+    if (joinedTarget && !newState.member?.user.bot) {
+      const guild = newState.guild
+      const existing = getVoiceConnection(guild.id)
+      if (existing) return // already in a voice channel in this guild
+
+      const ch = await client.channels.fetch(AUTO_VOICE_CHANNEL)
+      if (!ch || !ch.isVoiceBased() || !('guild' in ch) || !ch.guild) return
+
+      const connection = joinVoiceChannel({
+        channelId: ch.id,
+        guildId: ch.guild.id,
+        adapterCreator: ch.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: true,
+      })
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 15_000)
+        process.stderr.write(`discord: auto-joined voice channel ${AUTO_VOICE_CHANNEL}\n`)
+
+        // Start voice receive / STT
+        const injectSecret = process.env.DISCORD_INJECT_SECRET
+        if (injectSecret) {
+          const teardown = setupVoiceReceive(connection, client, injectSecret)
+          ;(connection as any)._voiceReceiveTeardown = teardown
+        }
+      } catch (err) {
+        connection.destroy()
+        process.stderr.write(`discord: failed to auto-join voice: ${err instanceof Error ? err.message : String(err)}\n`)
+      }
+      return
+    }
+
+    // Someone left the target channel — check if only bots remain
+    if (leftTarget) {
+      const guild = oldState.guild
+      const ch = guild.channels.cache.get(AUTO_VOICE_CHANNEL)
+      if (!ch || !ch.isVoiceBased()) return
+
+      const humanMembers = ch.members.filter(m => !m.user.bot)
+      if (humanMembers.size === 0) {
+        const connection = getVoiceConnection(guild.id)
+        if (connection) {
+          // Clean up voice receive
+          const teardown = (connection as any)._voiceReceiveTeardown
+          if (teardown) teardown()
+          connection.destroy()
+          process.stderr.write(`discord: auto-left voice channel ${AUTO_VOICE_CHANNEL} (no humans remaining)\n`)
+        }
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`discord: voiceStateUpdate error: ${err instanceof Error ? err.message : String(err)}\n`)
+  }
 })
 
 // Reaction notifications: when someone reacts to a message, notify Claude
@@ -950,6 +1215,125 @@ client.on('messageReactionAdd', async (reaction, user) => {
   }
 })
 
+// Message-delete notifications: when a message is deleted, notify Claude
+// with the original author and content (if cached). Same channel gate as reactions.
+client.on('messageDelete', async (msg) => {
+  try {
+    // Ignore bot messages
+    if (msg.author?.bot) return
+
+    const channelId = msg.channelId
+    const ch = await client.channels.fetch(channelId).catch(() => null)
+    if (!ch) return
+
+    // Gate: only deliver if this channel is in the access list
+    const access = loadAccess()
+    let allowed = false
+    if (ch.type === ChannelType.DM) {
+      const dmCh = ch as import('discord.js').DMChannel
+      allowed = access.allowFrom.includes(dmCh.recipientId ?? '')
+    } else {
+      const key = ch.isThread?.() ? (ch as import('discord.js').ThreadChannel).parentId ?? channelId : channelId
+      allowed = key in access.groups
+    }
+    if (!allowed) return
+
+    const isThread = ch.isThread?.() ?? false
+    const authorName = msg.author?.username ?? 'unknown'
+    const msgContent = msg.content
+    const msgId = msg.id
+
+    let content: string
+    if (msgContent) {
+      content = `[deleted] ${authorName} deleted a message in #${('name' in ch && ch.name) || channelId}: "${msgContent}"`
+    } else {
+      content = `[deleted] a message was deleted (id: ${msgId}) — content unavailable`
+    }
+
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id: channelId,
+          message_id: msgId,
+          user: authorName,
+          is_thread: isThread,
+          type: 'deleted',
+          ts: new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: failed to deliver delete event to Claude: ${err}\n`)
+    })
+  } catch (err) {
+    process.stderr.write(`discord channel: messageDelete error: ${err}\n`)
+  }
+})
+
+// Message-update notifications: when a message is edited, notify Claude
+// with old and new content. Same channel gate as reactions.
+client.on('messageUpdate', async (oldMsg, newMsg) => {
+  try {
+    // Fetch full new message if partial
+    const fullNew = newMsg.partial ? await newMsg.fetch().catch(() => null) : newMsg
+    if (!fullNew) return
+
+    // Ignore bot messages
+    if (fullNew.author?.bot) return
+
+    // Skip if content hasn't changed (Discord fires messageUpdate for embed loads, pin changes, etc.)
+    const oldContent = oldMsg.content
+    const newContent = fullNew.content
+    if (oldContent === newContent) return
+
+    const channelId = fullNew.channelId
+    const ch = await client.channels.fetch(channelId).catch(() => null)
+    if (!ch) return
+
+    // Gate: only deliver if this channel is in the access list
+    const access = loadAccess()
+    let allowed = false
+    if (ch.type === ChannelType.DM) {
+      const dmCh = ch as import('discord.js').DMChannel
+      allowed = access.allowFrom.includes(dmCh.recipientId ?? '')
+    } else {
+      const key = ch.isThread?.() ? (ch as import('discord.js').ThreadChannel).parentId ?? channelId : channelId
+      allowed = key in access.groups
+    }
+    if (!allowed) return
+
+    const isThread = ch.isThread?.() ?? false
+    const authorName = fullNew.author?.username ?? 'unknown'
+
+    let content: string
+    if (oldContent) {
+      content = `[edited] ${authorName} edited a message: "${oldContent}" → "${newContent}"`
+    } else {
+      content = `[edited] ${authorName} edited a message (old content unavailable): "${newContent}"`
+    }
+
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id: channelId,
+          message_id: fullNew.id,
+          user: authorName,
+          is_thread: isThread,
+          type: 'edited',
+          ts: fullNew.editedAt?.toISOString() ?? new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: failed to deliver edit event to Claude: ${err}\n`)
+    })
+  } catch (err) {
+    process.stderr.write(`discord channel: messageUpdate error: ${err}\n`)
+  }
+})
+
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
 
@@ -988,7 +1372,8 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
-  if ('sendTyping' in msg.channel) {
+  // Configurable via DISCORD_TYPING_INDICATORS env var (default: true).
+  if (process.env.DISCORD_TYPING_INDICATORS !== 'false' && 'sendTyping' in msg.channel) {
     void msg.channel.sendTyping().catch(() => {})
   }
 
@@ -1042,8 +1427,12 @@ async function handleInbound(msg: Message): Promise<void> {
     seenThreads.set(chat_id, now)
 
     if (isCold) {
+      const now2 = Date.now()
+      for (const [id, ts] of seenThreads.entries()) {
+        if (now2 - ts > THREAD_COLD_MS) seenThreads.delete(id)
+      }
       try {
-        const history = await msg.channel.messages.fetch({ limit: 10 })
+        const history = await msg.channel.messages.fetch({ limit: 5 })
         const botId = client.user?.id
         const sorted = [...history.values()]
           .filter(m => m.id !== msg.id && m.author.id !== botId)
