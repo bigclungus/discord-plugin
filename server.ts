@@ -88,7 +88,7 @@ async function connectToVoice(
     guildId,
     adapterCreator: adapterCreator as any,
     selfDeaf: false,
-    selfMute: true,
+    selfMute: false,
   })
 
   try {
@@ -859,12 +859,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         try {
-          // Unmute the bot so audio can be heard
-          connection.rejoin({
-            ...connection.joinConfig,
-            selfMute: false,
-          })
-
           // Create audio player and resource
           const player = createAudioPlayer({
             behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -897,11 +891,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             content: [{ type: 'text', text: `played ${(fileSize / 1024).toFixed(0)}KB audio file in guild ${resolvedGuildId}` }],
           }
         } finally {
-          // Re-mute after speaking (runs on success, error, and timeout)
-          connection.rejoin({
-            ...connection.joinConfig,
-            selfMute: true,
-          })
           // Clean up the audio file after playback
           try { unlinkSync(filePath) } catch {}
         }
