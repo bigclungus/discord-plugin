@@ -74,6 +74,45 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
+// ── Voice connection helpers (shared by join_voice tool + voiceStateUpdate auto-join) ──
+
+async function connectToVoice(
+  channelId: string,
+  guildId: string,
+  adapterCreator: any,
+  discordClient: Client,
+  injectSecret: string | undefined,
+): Promise<void> {
+  const connection = joinVoiceChannel({
+    channelId,
+    guildId,
+    adapterCreator: adapterCreator as any,
+    selfDeaf: false,
+    selfMute: true,
+  })
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000)
+  } catch (err) {
+    connection.destroy()
+    throw new Error(`failed to join voice channel: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  if (injectSecret) {
+    const teardown = setupVoiceReceive(connection, discordClient, injectSecret)
+    ;(connection as any)._voiceReceiveTeardown = teardown
+  }
+}
+
+function disconnectFromVoice(guildId: string): boolean {
+  const connection = getVoiceConnection(guildId)
+  if (!connection) return false
+  const teardown = (connection as any)._voiceReceiveTeardown
+  if (teardown) teardown()
+  connection.destroy()
+  return true
+}
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -769,27 +808,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!ch.isVoiceBased()) throw new Error(`channel ${channel_id} is not a voice channel`)
         if (!('guild' in ch) || !ch.guild) throw new Error(`channel ${channel_id} has no guild context`)
 
-        const connection = joinVoiceChannel({
-          channelId: ch.id,
-          guildId: ch.guild.id,
-          adapterCreator: ch.guild.voiceAdapterCreator,
-          selfDeaf: false,
-          selfMute: true,
-        })
-
-        try {
-          await entersState(connection, VoiceConnectionStatus.Ready, 15_000)
-        } catch (err) {
-          connection.destroy()
-          throw new Error(`failed to join voice channel: ${err instanceof Error ? err.message : String(err)}`)
-        }
-
-        // Start voice receive / STT
-        const injectSecret = process.env.DISCORD_INJECT_SECRET
-        if (injectSecret) {
-          const teardown = setupVoiceReceive(connection, client, injectSecret)
-          ;(connection as any)._voiceReceiveTeardown = teardown
-        }
+        await connectToVoice(ch.id, ch.guild.id, ch.guild.voiceAdapterCreator, client, process.env.DISCORD_INJECT_SECRET)
 
         return {
           content: [{ type: 'text', text: `joined voice channel ${channel_id} in guild ${ch.guild.id}` }],
@@ -797,16 +816,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'leave_voice': {
         const guild_id = args.guild_id as string
-        const connection = getVoiceConnection(guild_id)
-        if (!connection) {
+        if (!disconnectFromVoice(guild_id)) {
           return {
             content: [{ type: 'text', text: `not in a voice channel in guild ${guild_id}` }],
           }
         }
-        // Clean up voice receive
-        const teardown = (connection as any)._voiceReceiveTeardown
-        if (teardown) teardown()
-        connection.destroy()
         return {
           content: [{ type: 'text', text: `left voice channel in guild ${guild_id}` }],
         }
@@ -861,18 +875,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           connection.subscribe(player)
           player.play(resource)
 
-          // Wait for playback to finish
+          // Wait for playback to finish, cleaning up listeners + timer when done
           await new Promise<void>((resolve, reject) => {
-            player.on(AudioPlayerStatus.Idle, () => resolve())
-            player.on('error', (err: Error) => reject(new Error(`audio playback error: ${err.message}`)))
-            // Timeout after 2 minutes
-            setTimeout(() => reject(new Error('speak timed out after 120s')), 120_000)
-          })
+            let settled = false
+            const onIdle = () => { if (!settled) { settled = true; cleanup(); resolve() } }
+            const onError = (err: Error) => { if (!settled) { settled = true; cleanup(); reject(new Error(`audio playback error: ${err.message}`)) } }
+            const timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); reject(new Error('speak timed out after 120s')) } }, 120_000)
 
-          // Re-mute after speaking
-          connection.rejoin({
-            ...connection.joinConfig,
-            selfMute: true,
+            function cleanup() {
+              clearTimeout(timer)
+              player.removeListener(AudioPlayerStatus.Idle, onIdle)
+              player.removeListener('error', onError)
+            }
+
+            player.on(AudioPlayerStatus.Idle, onIdle)
+            player.on('error', onError)
           })
 
           const fileSize = statSync(filePath).size
@@ -880,6 +897,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             content: [{ type: 'text', text: `played ${(fileSize / 1024).toFixed(0)}KB audio file in guild ${resolvedGuildId}` }],
           }
         } finally {
+          // Re-mute after speaking (runs on success, error, and timeout)
+          connection.rejoin({
+            ...connection.joinConfig,
+            selfMute: true,
+          })
           // Clean up the audio file after playback
           try { unlinkSync(filePath) } catch {}
         }
@@ -1080,26 +1102,10 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       const ch = await client.channels.fetch(AUTO_VOICE_CHANNEL)
       if (!ch || !ch.isVoiceBased() || !('guild' in ch) || !ch.guild) return
 
-      const connection = joinVoiceChannel({
-        channelId: ch.id,
-        guildId: ch.guild.id,
-        adapterCreator: ch.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: true,
-      })
-
       try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000)
+        await connectToVoice(ch.id, ch.guild.id, ch.guild.voiceAdapterCreator, client, process.env.DISCORD_INJECT_SECRET)
         process.stderr.write(`discord: auto-joined voice channel ${AUTO_VOICE_CHANNEL}\n`)
-
-        // Start voice receive / STT
-        const injectSecret = process.env.DISCORD_INJECT_SECRET
-        if (injectSecret) {
-          const teardown = setupVoiceReceive(connection, client, injectSecret)
-          ;(connection as any)._voiceReceiveTeardown = teardown
-        }
       } catch (err) {
-        connection.destroy()
         process.stderr.write(`discord: failed to auto-join voice: ${err instanceof Error ? err.message : String(err)}\n`)
       }
       return
@@ -1113,12 +1119,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
       const humanMembers = ch.members.filter(m => !m.user.bot)
       if (humanMembers.size === 0) {
-        const connection = getVoiceConnection(guild.id)
-        if (connection) {
-          // Clean up voice receive
-          const teardown = (connection as any)._voiceReceiveTeardown
-          if (teardown) teardown()
-          connection.destroy()
+        if (disconnectFromVoice(guild.id)) {
           process.stderr.write(`discord: auto-left voice channel ${AUTO_VOICE_CHANNEL} (no humans remaining)\n`)
         }
       }
