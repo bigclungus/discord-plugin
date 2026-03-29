@@ -422,9 +422,15 @@ export function setupVoiceReceive(
 
     // Concatenate all PCM chunks (already 16 kHz mono)
     const pcm = Buffer.concat(buf.chunks)
+    const durationSec = (pcm.length / (16000 * 2)).toFixed(2)  // 16kHz 16-bit mono = 32000 bytes/sec
+
+    console.log(`[vc-debug] flushBuffer userId=${userId} username=${buf.username} chunks=${buf.chunks.length} bytes=${pcm.length} duration=${durationSec}s`)
 
     // Skip very short audio (< 0.5s at 16kHz 16-bit mono = 16000 bytes)
-    if (pcm.length < 16000) return
+    if (pcm.length < 16000) {
+      console.log(`[vc-debug] flushBuffer FILTERED: too short (${pcm.length} bytes < 16000) for ${buf.username}`)
+      return
+    }
 
     const wavPath = join(TMP_DIR, `vc-${randomBytes(6).toString('hex')}.wav`)
 
@@ -435,6 +441,7 @@ export function setupVoiceReceive(
       const text = await transcribeWav(wavPath)
 
       if (isValidTranscription(text)) {
+        console.log(`[vc-debug] transcription ACCEPTED for ${buf.username}: "${text}" — injecting to chatId=${injectChatId}`)
         await injectTranscription(buf.username, text, injectSecret, injectChatId)
 
         // Add to session transcript
@@ -444,6 +451,12 @@ export function setupVoiceReceive(
           timestamp: new Date(),
           isBot: false,
         })
+      } else {
+        // Log why it was filtered
+        const normalized = text.toLowerCase().replace(/[.,!?]/g, '').trim()
+        const isHallucination = HALLUCINATION_PHRASES.has(normalized)
+        const wordCount = normalized.split(/\s+/).filter(Boolean).length
+        console.log(`[vc-debug] transcription FILTERED for ${buf.username}: "${text}" — hallucination=${isHallucination} wordCount=${wordCount} minRequired=${MIN_WORD_COUNT}`)
       }
     } catch (err) {
       process.stderr.write(
@@ -465,7 +478,15 @@ export function setupVoiceReceive(
     if (destroyed) return
 
     // If there's already a subscription for this user, don't double-subscribe.
-    if (connection.receiver.subscriptions.has(userId)) return
+    if (connection.receiver.subscriptions.has(userId)) {
+      console.log(`[vc-debug] onSpeakingStart userId=${userId} — already subscribed, skipping`)
+      return
+    }
+
+    console.log(`[vc-debug] onSpeakingStart userId=${userId} — subscribing to audio stream`)
+    resolveUsername(client, userId).then((name) => {
+      console.log(`[vc-debug] onSpeakingStart resolved username=${name} for userId=${userId}`)
+    }).catch(() => {})
 
     const stream = connection.receiver.subscribe(userId, {
       end: {
